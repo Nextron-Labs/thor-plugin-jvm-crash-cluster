@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: go vet
+        run: go vet ./...
+      - name: Tag matches metadata.yml version
+        run: grep -q "^version: ${GITHUB_REF_NAME}$" metadata.yml
+      - name: Build plugin ZIP
+        # stdlib only: no vendor/ needed, thor-plugin and jsonlog are provided by THOR
+        run: zip -j jvm-crash-cluster.zip plugin.go metadata.yml
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: jvm-crash-cluster.zip
+          generate_release_notes: true

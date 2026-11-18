@@ -1,0 +1,10 @@
+name: JVMCrashCluster
+version: v0.1.0
+description: |
+  Flags bursts of HotSpot fatal error logs (hs_err_pid*.log) in the same directory,
+  JVM crashes inside garbage collection, and crash logs that show a configuration
+  exposed to CVE-2026-114938 (Java4Shell). Repeated JVM crashes are a side effect
+  of retried memory corruption exploitation attempts.
+author: Florian Roth
+requires_thor: v11.0.0-0  # -0 also accepts v11 pre-releases (rc, dev)
+link: https://github.com/Nextron-Labs/thor-plugin-jvm-crash-cluster
