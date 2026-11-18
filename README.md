@@ -17,8 +17,17 @@ decoder.
 | `JVM_Crash_In_Garbage_Collection` | 40 | The crashing thread is a GC worker, the safepoint VM operation is a collection, or the problematic frame is in G1 / GC / object model code. Heap corruption usually surfaces there. |
 | `JVM_Crash_CVE_2026_114938_Exposed_Config` | 20 | Only on top of one of the above: x86-64, AVX-512 VBMI in the CPU features, and neither `-XX:-UseBASE64Intrinsics` nor `-XX:UseAVX=0..2` set |
 
-THOR combines sub-scores with diminishing returns. Results with THOR 11.0.0-rc.3: burst only = 60, burst + GC = 68,
-all three = 70 (all Warnings). A single crash in GC code alone gives a Notice (40).
+THOR combines sub-scores with diminishing returns, so they don't simply add up. Results with THOR 11.0.0-rc.3:
+
+| Situation | Score | Level |
+|---|---|---|
+| Burst | 60 | Warning |
+| Burst + exposed configuration | 64 | Warning |
+| Burst + crash in GC code | 68 | Warning |
+| Burst + crash in GC code + exposed configuration | 70 | Warning |
+| Single crash in GC code | 40 (46 on an exposed configuration) | Notice |
+| Single crash elsewhere, or crashes spread out over time | – | no finding, Info line only |
+| Native out-of-memory crash log | – | ignored |
 
 Every reason text carries the error line, the JRE version, the command line and a CVE-2026-114938 verdict
 (`exposed configuration, check JDK patch level` / `not exposed (...)` / `unknown`). The verdict is part of the text
@@ -54,16 +63,27 @@ at start-up. `--no-plugins` disables all plugins for a run.
 
 ## How it works
 
-1. A meta YARA rule with score 0 (tag `JVMCRASHLOG`) matches the fatal error header in the first 256 bytes. It
-   doesn't depend on the file name, so logs renamed with `-XX:ErrorFile` are caught too.
-2. On the first match in a directory, the plugin lists that directory. It checks the first 4 KB of every `*.log` or
-   `*hs_err*` sibling for the header, takes the modification times, and caches the result per directory.
-3. A sliding window over the sorted modification times finds dense windows.
-4. Native out-of-memory logs ("There is insufficient memory for the Java Runtime Environment to continue") are
-   ignored. They come in crash loops on misconfigured systems and are the main false positive source.
+1. **Find crash logs.** A meta YARA rule with score 0 (tag `JVMCRASHLOG`) matches the fatal error header in the
+   first 256 bytes. It doesn't depend on the file name, so logs renamed with `-XX:ErrorFile` are caught too. THOR
+   then calls the plugin for each matching file.
+2. **Read the crash log.** The plugin reads up to 8 MB of the file and extracts:
+   - the error line, e.g. `SIGSEGV (0xb) at pc=…, pid=…, tid=…`
+   - the `JRE version` and `Java VM` lines (the VM line includes the architecture, e.g. `linux-amd64`)
+   - the problematic frame, the crashing thread (`Current thread`) and the running `VM_Operation`
+   - the command line (`Command Line:`, falling back to `java_command:`) and `jvm_args`
+   - the CPU features (HotSpot `CPU:` line and, on Linux, the `/proc/cpuinfo` flags)
 
-Every crash log, flagged or not, also produces an Info line `JVM fatal error log found` with error, thread, frame
-and command.
+   Native out-of-memory logs ("There is insufficient memory for the Java Runtime Environment to continue") stop
+   here: no Info line, no reason, and they don't count towards bursts. They come in crash loops on misconfigured
+   systems and are the main false positive source.
+3. **Log it.** Every other crash log produces an Info line `JVM fatal error log found` with error, JRE, thread,
+   frame and command, whether or not a reason fires.
+4. **Check the folder.** On the first crash log in a directory, the plugin lists that directory once. It checks the
+   first 4 KB of every `*.log` or `*hs_err*` sibling for the header, takes the modification times, and caches the
+   result per directory. A sliding window over the sorted modification times finds dense windows; every file in
+   one gets the burst reason.
+5. **Check the crash itself.** The GC check uses the thread, VM operation and frame; the exposure check uses the
+   architecture, CPU features and JVM arguments (see [Reasons](#reasons)).
 
 ## Tuning
 
@@ -80,10 +100,14 @@ limits.
   overlay paths) isn't correlated.
 - **No JDK version check.** The exposure verdict only covers CPU and flags. Compare the JRE version in the reason
   text with the fixed releases of your JDK vendor.
+- **Crash logs only.** The plugin doesn't look at application or access logs, Java exception traces or process
+  memory. Other traces of an attack have to come from other THOR modules and rules.
+- **No scan summary.** THOR has no end-of-scan hook for plugins, so there's no per-host summary line. Each crash log
+  carries its own reasons.
 
 ## Test
 
-`test/make_fixtures.py` writes synthetic crash logs for six cases:
+`test/make_fixtures.py` writes synthetic crash logs for eight cases:
 
 ```bash
 python3 -I test/make_fixtures.py /tmp/jvm-fixtures
@@ -98,6 +122,8 @@ python3 -I test/make_fixtures.py /tmp/jvm-fixtures
 | `svc_d_burst_mitigated` | 3 × score 60, burst only, verdict "not exposed (mitigation flag set)" |
 | `svc_e_spread` | Info only |
 | `svc_f_renamed_arm` | 3 × score 68, verdict "not exposed (not x86-64)" |
+| `svc_g_single_gc_exposed` | 1 × score 46 (Notice), GC + exposure, no burst |
+| `svc_h_burst_exposed` | 3 × score 64, burst + exposure |
 
 Verified with THOR 11.0.0-rc.3 on macOS (arm64).
 

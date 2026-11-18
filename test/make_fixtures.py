@@ -130,6 +130,16 @@ def main():
         pid = 9100 + i
         crash(os.path.join(d, f"jvm_crash_{pid}.log"), pid, base + timedelta(minutes=i * 4), arch="linux-aarch64", vbmi=False)
 
+    # G: single GC crash, exposed config -> GC + exposure, no burst (Notice)
+    d = os.path.join(out, "svc_g_single_gc_exposed"); os.makedirs(d, exist_ok=True)
+    crash(os.path.join(d, "hs_err_pid9200.log"), 9200, base)
+
+    # H: burst of non-GC crashes, exposed config -> burst + exposure
+    d = os.path.join(out, "svc_h_burst_exposed"); os.makedirs(d, exist_ok=True)
+    for i in range(3):
+        pid = 9300 + i
+        crash(os.path.join(d, f"hs_err_pid{pid}.log"), pid, base + timedelta(minutes=i * 5), gc=False)
+
     print("fixtures written to", out)
 
 
