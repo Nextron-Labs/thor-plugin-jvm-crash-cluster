@@ -18,7 +18,8 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: Tag matches metadata.yml version
-        run: grep -q "^version: ${GITHUB_REF_NAME}$" metadata.yml
+        run: |
+          grep -q "^version: ${GITHUB_REF_NAME}$" metadata.yml
       - name: Build plugin ZIP
         # stdlib only: no vendor/ needed, thor-plugin and jsonlog are provided by THOR
         run: zip -j jvm-crash-cluster.zip plugin.go metadata.yml
