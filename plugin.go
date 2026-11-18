@@ -12,16 +12,19 @@
 //     fatal error header (independent of the file name, -XX:ErrorFile can
 //     rename it).
 //   - On the first match in a directory, the plugin lists that directory,
-//     collects all sibling crash logs (header check on the first 4 KB) and
-//     their modification times, and caches the result.
-//   - Every crash log that belongs to a sliding window with at least
-//     clusterMinCount crashes within clusterWindow gets a reason.
+//     parses all sibling crash logs (modification time, JVM uptime at the
+//     crash, problematic frame) and caches the result.
+//   - Two time windows: clusterMinCount crashes within burstWindow make a
+//     burst, within repeatWindow a slower series of repeated crashes.
+//   - A window in which every crash happened shortly after JVM start-up at the
+//     same frame is a crash loop (broken configuration, JDK or native library)
+//     and does not count.
 //   - Supporting reasons: crash inside a GC thread / GC code (typical for heap
 //     corruption) and a host / JVM configuration that is exposed to
 //     CVE-2026-114938 (x86-64, AVX-512 VBMI, no mitigation flag).
 //
 // Native out-of-memory crash logs are ignored. They come in crash loops on
-// misconfigured systems and are the main false positive source.
+// misconfigured systems and are a common false positive source.
 package main
 
 import (
@@ -32,6 +35,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,16 +49,22 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	clusterWindow   = 60 * time.Minute // max time span between first and last crash of a cluster
-	clusterMinCount = 3                // crashes within clusterWindow that make a cluster
+	burstWindow     = 15 * time.Minute // fast tier: retried attempts against a service that restarts quickly
+	repeatWindow    = 60 * time.Minute // slow tier: slow-starting services or paced attempts
+	clusterMinCount = 3                // crashes within a window that make a burst / series
 
-	scoreCluster  = 60 // burst of crashes in one directory
+	// A window is a crash loop if every crash happened within this many seconds
+	// after JVM start-up and all crashes share the same (normalized) frame.
+	crashLoopMaxUptime = 120.0
+
+	scoreBurst    = 60 // >= clusterMinCount crashes within burstWindow
+	scoreRepeated = 40 // >= clusterMinCount crashes within repeatWindow
 	scoreGCCrash  = 40 // crash in GC thread / GC code (heap corruption)
 	scoreExposure = 20 // only added on top of one of the above
 
 	maxDirEntries  = 5000    // directory entries inspected per directory
 	maxSiblingHead = 4096    // bytes read from sibling files for the header check
-	maxReportBytes = 8 << 20 // bytes read from the matched crash log
+	maxReportBytes = 8 << 20 // bytes read from each crash log
 	maxListedFiles = 10      // sibling names quoted in the reason text
 
 	ruleTag   = "JVMCRASHLOG"
@@ -94,10 +104,15 @@ var (
 	reCmdLine     = regexp.MustCompile(`(?m)^Command Line: ([^\r\n]+)`)
 	reJavaCmd     = regexp.MustCompile(`(?m)^java_command: ([^\r\n]+)`)
 	reJVMArgs     = regexp.MustCompile(`(?m)^jvm_args: ([^\r\n]+)`)
+	reUptime      = regexp.MustCompile(`elapsed time: ([0-9]+(?:\.[0-9]+)?) seconds`)
 	reVBMI        = regexp.MustCompile(`\bavx512_?vbmi\b`)
 	reX86         = regexp.MustCompile(`amd64|x86_64`)
 	reNoIntrinsic = regexp.MustCompile(`-XX:-UseBASE64Intrinsics\b`)
 	reLowAVX      = regexp.MustCompile(`-XX:UseAVX=[0-2]\b`)
+
+	// Frame normalization: addresses, offsets and compile IDs change with every JVM start.
+	reHexNum = regexp.MustCompile(`0x[0-9a-fA-F]+`)
+	reDecNum = regexp.MustCompile(`\b[0-9]+\b`)
 
 	// Crashing thread is a GC worker (JDK 8 to 25 naming)
 	reGCThread = regexp.MustCompile(`GC Thread#|"G1 [A-Za-z]|GCTaskThread|ConcurrentGCThread|"(?:ZGC|Shenandoah|PS|CMS) `)
@@ -116,6 +131,7 @@ type crashReport struct {
 	vmOp      string
 	command   string
 	jvmArgs   string
+	uptime    float64 // JVM uptime at the crash in seconds, -1 if unknown
 	nativeOOM bool
 	cpuKnown  bool
 	vbmi      bool
@@ -140,16 +156,31 @@ func parseReport(data []byte) crashReport {
 		vmOp:      firstGroup(reVMOp, data),
 		command:   firstGroup(reCmdLine, data),
 		jvmArgs:   firstGroup(reJVMArgs, data),
+		uptime:    -1,
 		nativeOOM: bytes.Contains(data, []byte(nativeOOMHeader)),
 	}
 	if r.command == "" {
 		r.command = firstGroup(reJavaCmd, data)
+	}
+	// JDK 11+: "Time: ... elapsed time: 412.337 seconds (...)", JDK 8: "elapsed time: 412 seconds (...)"
+	if s := firstGroup(reUptime, data); s != "" {
+		if v, err := strconv.ParseFloat(s, 64); err == nil {
+			r.uptime = v
+		}
 	}
 	r.vbmi = reVBMI.Match(data)
 	// CPU details are in the System section ("CPU:" line, /proc/cpuinfo flags on Linux)
 	r.cpuKnown = r.vbmi || bytes.Contains(data, []byte("\nCPU:")) || bytes.Contains(data, []byte("flags\t"))
 	r.x86 = reX86.MatchString(r.vm)
 	return r
+}
+
+// normalizeFrame removes addresses, offsets and compile IDs so that the same
+// crash location compares equal across JVM restarts.
+func normalizeFrame(frame string) string {
+	f := reHexNum.ReplaceAllString(frame, "")
+	f = reDecNum.ReplaceAllString(f, "")
+	return strings.Join(strings.Fields(f), " ")
 }
 
 func (r crashReport) gcCrash() bool {
@@ -214,17 +245,25 @@ func readHead(path string, limit int) []byte {
 // ---------------------------------------------------------------------------
 
 type crashFile struct {
-	name  string
-	mtime time.Time
+	name   string
+	mtime  time.Time
+	uptime float64 // seconds, -1 if unknown
+	frame  string  // normalized problematic frame
 }
 
-type dirCluster struct {
-	maxCount int             // highest number of crashes within one window
-	total    int             // crash logs in the directory (native OOM excluded)
-	members  map[string]bool // crash logs that are part of at least one dense window
+type tierResult struct {
+	window   time.Duration
+	maxCount int             // highest number of crashes within one counted window
+	members  map[string]bool // crash logs that are part of at least one counted window
 	first    time.Time       // first crash of the densest window
 	last     time.Time       // last crash of the densest window
 	names    []string        // crash logs of the densest window
+}
+
+type dirCluster struct {
+	total    int // crash logs in the directory (native OOM excluded)
+	burst    *tierResult
+	repeated *tierResult
 }
 
 var (
@@ -243,11 +282,66 @@ func clusterFor(dir string, logger thor.Logger) *dirCluster {
 	return c
 }
 
+func newTier(window time.Duration) *tierResult {
+	return &tierResult{window: window, members: map[string]bool{}}
+}
+
+// isCrashLoop reports whether all crashes of a window happened shortly after
+// JVM start-up at the same frame. Unknown uptimes or frames never count as
+// crash loop, so missing data keeps the detection.
+func isCrashLoop(w []crashFile) bool {
+	for _, c := range w {
+		if c.uptime < 0 || c.uptime > crashLoopMaxUptime || c.frame == "" || c.frame != w[0].frame {
+			return false
+		}
+	}
+	return true
+}
+
+// findWindows slides a window over the crashes (sorted by mtime). Every crash
+// in a window with at least clusterMinCount crashes becomes a member, unless
+// that window is a crash loop.
+func findWindows(crashes []crashFile, window time.Duration, loops map[string]bool) *tierResult {
+	t := newTier(window)
+	start := 0
+	bestStart, bestEnd := 0, -1
+	for end := range crashes {
+		for crashes[end].mtime.Sub(crashes[start].mtime) > window {
+			start++
+		}
+		count := end - start + 1
+		if count < clusterMinCount {
+			continue
+		}
+		if isCrashLoop(crashes[start : end+1]) {
+			for k := start; k <= end; k++ {
+				loops[crashes[k].name] = true
+			}
+			continue
+		}
+		for k := start; k <= end; k++ {
+			t.members[crashes[k].name] = true
+		}
+		if count > t.maxCount {
+			t.maxCount = count
+			bestStart, bestEnd = start, end
+		}
+	}
+	if bestEnd >= 0 {
+		t.first = crashes[bestStart].mtime
+		t.last = crashes[bestEnd].mtime
+		for k := bestStart; k <= bestEnd; k++ {
+			t.names = append(t.names, crashes[k].name)
+		}
+	}
+	return t
+}
+
 func computeCluster(dir string, logger thor.Logger) *dirCluster {
-	c := &dirCluster{members: map[string]bool{}}
+	c := &dirCluster{burst: newTier(burstWindow), repeated: newTier(repeatWindow)}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// e.g. --path-remap in use or file inside an archive
+		// e.g. file inside an archive
 		logger.Debug("JVMCrashCluster: cannot list directory", "dir", dir, "error", err.Error())
 		return c
 	}
@@ -265,7 +359,8 @@ func computeCluster(dir string, logger thor.Logger) *dirCluster {
 		if !strings.HasSuffix(lname, ".log") && !strings.Contains(lname, "hs_err") {
 			continue
 		}
-		head := readHead(filepath.Join(dir, e.Name()), maxSiblingHead)
+		path := filepath.Join(dir, e.Name())
+		head := readHead(path, maxSiblingHead)
 		if !bytes.Contains(head, []byte(crashHeader)) || bytes.Contains(head, []byte(nativeOOMHeader)) {
 			continue
 		}
@@ -273,7 +368,17 @@ func computeCluster(dir string, logger thor.Logger) *dirCluster {
 		if err != nil {
 			continue
 		}
-		crashes = append(crashes, crashFile{name: e.Name(), mtime: info.ModTime()})
+		size := info.Size()
+		if size > maxReportBytes {
+			size = maxReportBytes
+		}
+		r := parseReport(readHead(path, int(size)))
+		crashes = append(crashes, crashFile{
+			name:   e.Name(),
+			mtime:  info.ModTime(),
+			uptime: r.uptime,
+			frame:  normalizeFrame(r.frame),
+		})
 	}
 	c.total = len(crashes)
 	if len(crashes) < clusterMinCount {
@@ -282,30 +387,23 @@ func computeCluster(dir string, logger thor.Logger) *dirCluster {
 
 	sort.Slice(crashes, func(i, j int) bool { return crashes[i].mtime.Before(crashes[j].mtime) })
 
-	start := 0
-	bestStart, bestEnd := 0, -1
-	for end := range crashes {
-		for crashes[end].mtime.Sub(crashes[start].mtime) > clusterWindow {
-			start++
-		}
-		count := end - start + 1
-		if count < clusterMinCount {
-			continue
-		}
-		for k := start; k <= end; k++ {
-			c.members[crashes[k].name] = true
-		}
-		if count > c.maxCount {
-			c.maxCount = count
-			bestStart, bestEnd = start, end
+	loops := map[string]bool{}
+	c.burst = findWindows(crashes, burstWindow, loops)
+	c.repeated = findWindows(crashes, repeatWindow, loops)
+
+	// Report crash loops once per directory (only files that are not counted otherwise)
+	var loopNames []string
+	loopFrame := ""
+	for _, cr := range crashes {
+		if loops[cr.name] && !c.burst.members[cr.name] && !c.repeated.members[cr.name] {
+			loopNames = append(loopNames, cr.name)
+			loopFrame = cr.frame
 		}
 	}
-	if bestEnd >= 0 {
-		c.first = crashes[bestStart].mtime
-		c.last = crashes[bestEnd].mtime
-		for k := bestStart; k <= bestEnd; k++ {
-			c.names = append(c.names, crashes[k].name)
-		}
+	if len(loopNames) > 0 {
+		logger.Info("JVMCrashCluster: JVM crash loop at start-up, not counted as burst",
+			"dir", dir, "count", len(loopNames), "frame", truncate(loopFrame, 160),
+			"files", truncate(strings.Join(loopNames, ", "), 300))
 	}
 	return c
 }
@@ -337,11 +435,19 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+func formatUptime(seconds float64) string {
+	if seconds < 0 {
+		return "unknown"
+	}
+	return (time.Duration(seconds) * time.Second).String()
+}
+
 func context(r crashReport) string {
 	parts := []string{}
 	if r.errorLine != "" {
 		parts = append(parts, "error: "+truncate(r.errorLine, 120))
 	}
+	parts = append(parts, "uptime: "+formatUptime(r.uptime))
 	if r.jre != "" {
 		parts = append(parts, "jre: "+truncate(r.jre, 120))
 	}
@@ -350,6 +456,19 @@ func context(r crashReport) string {
 	}
 	parts = append(parts, "CVE-2026-114938: "+r.exposureVerdict())
 	return strings.Join(parts, " | ")
+}
+
+func windowSummary(label string, t *tierResult, total int, r crashReport) string {
+	names := t.names
+	more := ""
+	if len(names) > maxListedFiles {
+		more = fmt.Sprintf(" (+%d more)", len(names)-maxListedFiles)
+		names = names[:maxListedFiles]
+	}
+	return fmt.Sprintf("%s: %d fatal error logs within %s in the same directory (window %d min, %d crash logs in total), %s to %s, files: %s%s | %s",
+		label, t.maxCount, t.last.Sub(t.first).Round(time.Second), int(t.window.Minutes()), total,
+		t.first.UTC().Format(time.RFC3339), t.last.UTC().Format(time.RFC3339),
+		strings.Join(names, ", "), more, context(r))
 }
 
 func onCrashLog(scanner thor.Scanner, obj thor.MatchingObject) {
@@ -364,26 +483,26 @@ func onCrashLog(scanner thor.Scanner, obj thor.MatchingObject) {
 	}
 
 	scanner.Info("JVM fatal error log found",
-		"file", file.Path, "error", r.errorLine, "jre", r.jre, "thread", truncate(r.thread, 120),
-		"frame", truncate(r.frame, 160), "command", truncate(r.command, 200))
+		"file", file.Path, "error", r.errorLine, "uptime", formatUptime(r.uptime), "jre", r.jre,
+		"thread", truncate(r.thread, 120), "frame", truncate(r.frame, 160), "command", truncate(r.command, 200))
 
 	flagged := false
 
-	// 1) burst of crashes in the same directory
+	// 1) burst or slower series of crashes in the same directory (crash loops excluded)
 	c := clusterFor(filepath.Dir(file.Path), scanner)
-	if c.members[filepath.Base(file.Path)] {
-		names := c.names
-		more := ""
-		if len(names) > maxListedFiles {
-			more = fmt.Sprintf(" (+%d more)", len(names)-maxListedFiles)
-			names = names[:maxListedFiles]
-		}
-		summary := fmt.Sprintf("JVM crash burst: %d fatal error logs within %s in the same directory (%d in total), window %s to %s, files: %s%s | %s",
-			c.maxCount, c.last.Sub(c.first).Round(time.Second), c.total,
-			c.first.UTC().Format(time.RFC3339), c.last.UTC().Format(time.RFC3339),
-			strings.Join(names, ", "), more, context(r))
-		scanner.AddReason(newReason("JVM_Crash_Log_Burst", scoreCluster, summary,
-			"Several HotSpot fatal error logs were written in a short time span. Repeated JVM crashes of an exposed service are a side effect of retried memory corruption exploitation attempts."))
+	name := filepath.Base(file.Path)
+	switch {
+	case c.burst.members[name]:
+		scanner.AddReason(newReason("JVM_Crash_Log_Burst", scoreBurst,
+			windowSummary("JVM crash burst", c.burst, c.total, r),
+			fmt.Sprintf("%d or more HotSpot fatal error logs within %d minutes in one directory, not explained by a crash loop at JVM start-up. Repeated JVM crashes of an exposed service are a side effect of retried memory corruption exploitation attempts.",
+				clusterMinCount, int(burstWindow.Minutes()))))
+		flagged = true
+	case c.repeated.members[name]:
+		scanner.AddReason(newReason("JVM_Crash_Log_Repeated", scoreRepeated,
+			windowSummary("Repeated JVM crashes", c.repeated, c.total, r),
+			fmt.Sprintf("%d or more HotSpot fatal error logs within %d minutes in one directory, not explained by a crash loop at JVM start-up. Slower than a burst: a service with a long start-up time or paced exploitation attempts.",
+				clusterMinCount, int(repeatWindow.Minutes()))))
 		flagged = true
 	}
 
@@ -411,5 +530,7 @@ func onCrashLog(scanner thor.Scanner, obj thor.MatchingObject) {
 func Init(config thor.Configuration, logger thor.Logger, actions thor.RegisterActions) {
 	actions.AddYaraRule(thor.TypeMeta, triggerRule)
 	actions.AddRuleHook(ruleTag, onCrashLog)
-	logger.Info("JVMCrashCluster plugin loaded", "window", clusterWindow.String(), "min_count", clusterMinCount)
+	logger.Info("JVMCrashCluster plugin loaded",
+		"burst_window", burstWindow.String(), "repeat_window", repeatWindow.String(),
+		"min_count", clusterMinCount, "crash_loop_max_uptime_s", crashLoopMaxUptime)
 }
